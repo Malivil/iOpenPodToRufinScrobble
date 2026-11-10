@@ -119,47 +119,61 @@ namespace iOpenPodToRufinScrobble
         {
             Console.WriteLine($"Syncing {songDataList.Count} play counts to Rufin...");
 
-            var rufinCachePath = configuration.GetValue<string>("RufinCachePath").Replace("~", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            var rufinDataPath = configuration.GetValue<string>("RufinDataPath").Replace("~", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
 
-            if (string.IsNullOrWhiteSpace(rufinCachePath))
+            if (string.IsNullOrWhiteSpace(rufinDataPath))
             {
-                PrintError("Rufin cache path is not configured. Please check appsettings.json.");
+                PrintError("Rufin data path is not configured. Please check appsettings.json.");
                 return false;
             }
 
-            var rufinCatalogPath = Path.Combine(rufinCachePath, "store", "rufin-catalog.sqlite");
-            if (!File.Exists(rufinCatalogPath))
+            var rufinLibraryPath = Path.Combine(rufinDataPath, "store", "rufin-library.sqlite");
+            if (!File.Exists(rufinLibraryPath))
             {
-                PrintError($"Rufin catalog database not found at: {rufinCatalogPath}");
+                PrintError($"Rufin catalog database not found at: {rufinLibraryPath}");
                 return false;
             }
 
-            var rufinCatalogWorkingPath = Path.Combine(Path.GetDirectoryName(rufinCatalogPath), "rufin-catalog.working.sqlite");
-            var rufinCatalogBackupPath = Path.Combine(Path.GetDirectoryName(rufinCatalogPath), "rufin-catalog.backup.sqlite");
+            var rufinLibraryWorkingPath = Path.Combine(Path.GetDirectoryName(rufinLibraryPath), "rufin-library.working.sqlite");
+            var rufinLibraryBackupPath = Path.Combine(Path.GetDirectoryName(rufinLibraryPath), "rufin-library.backup.sqlite");
 
             try
             {
-                File.Copy(rufinCatalogPath, rufinCatalogWorkingPath, true);
+                File.Copy(rufinLibraryPath, rufinLibraryWorkingPath, true);
 
-                using var catalogConnection = new SqliteConnection($"Data Source={rufinCatalogWorkingPath}");
+                using var catalogConnection = new SqliteConnection($"Data Source={rufinLibraryWorkingPath}");
                 catalogConnection.Open();
 
+                // Clear the existing listens table
+                using var clearListensCommand = catalogConnection.CreateCommand();
+                clearListensCommand.CommandText = "DELETE FROM listens";
+                clearListensCommand.ExecuteNonQuery();
+
+                // Listen parameters
+                var listenId = Guid.NewGuid().ToString("N");
+                var startedAt = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                var localPeriod = DateTime.Now.ToString("yyyy-MM");
+
+                // Process each song
                 var count = 0;
                 foreach (var songData in songDataList)
                 {
                     count++;
-                    if (count % 100 == 0)
+                    if (count % 100 == 0 || count == songDataList.Count)
                     {
                         Console.WriteLine($"Processed {count}/{songDataList.Count}");
                     }
 
+                    // Find all the info we need for the listens
                     using var objectIdCommand = catalogConnection.CreateCommand();
                     objectIdCommand.CommandText = """
-                        SELECT object_id, source_key
+                        SELECT object_id, source_key, media_uri, title, display_artist, display_album, disc_number, track_number, year, release_date, source_format, duration_millis
                         FROM tracks
                         WHERE title = $songName COLLATE NOCASE
                           AND display_album = $albumName COLLATE NOCASE
                           AND display_artist = $artistName COLLATE NOCASE
+                          AND object_id IS NOT NULL
+                          AND source_key IS NOT NULL
                     """;
                     objectIdCommand.Parameters.AddWithValue("$songName", songData.SongName);
                     objectIdCommand.Parameters.AddWithValue("$albumName", songData.AlbumName);
@@ -169,22 +183,76 @@ namespace iOpenPodToRufinScrobble
 
                     var objectId = string.Empty;
                     int? sourceKey = null;
+                    var mediaUri = string.Empty;
+                    var title = string.Empty;
+                    var artist = string.Empty;
+                    var album = string.Empty;
+                    int? discNumber = null;
+                    int? trackNumber = null;
+                    int? year = null;
+                    var releaseDate = string.Empty;
+                    var sourceFormat = string.Empty;
+                    int? duration = null;
                     while (objectIdReader.Read())
                     {
                         objectId = objectIdReader.GetString(0);
-                        sourceKey = objectIdReader.GetInt32(1);
+                        sourceKey = objectIdReader.IsDBNull(1) ? null : objectIdReader.GetInt32(1);
+                        mediaUri = objectIdReader.GetString(2);
+                        title = objectIdReader.GetString(3);
+                        artist = objectIdReader.GetString(4);
+                        album = objectIdReader.GetString(5);
+                        discNumber = objectIdReader.IsDBNull(6) ? null : objectIdReader.GetInt32(6);
+                        trackNumber = objectIdReader.IsDBNull(7) ? null : objectIdReader.GetInt32(7);
+                        year = objectIdReader.IsDBNull(8) ? null : objectIdReader.GetInt32(8);
+                        releaseDate = objectIdReader.IsDBNull(9) ? null : objectIdReader.GetString(9);
+                        sourceFormat = objectIdReader.GetString(10);
+                        duration = objectIdReader.IsDBNull(11) ? null : objectIdReader.GetInt32(11);
                     }
 
-                    if (string.IsNullOrWhiteSpace(objectId) || !sourceKey.HasValue)
+                    if (string.IsNullOrWhiteSpace(objectId) || !sourceKey.HasValue || string.IsNullOrWhiteSpace(mediaUri) ||
+                        string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(album) ||
+                        !discNumber.HasValue || !trackNumber.HasValue ||
+                        string.IsNullOrWhiteSpace(sourceFormat) || !duration.HasValue)
                     {
-                        PrintWarning($"Could not find object_id for '{songData.SongName}' by '{songData.ArtistName}' from '{songData.AlbumName}'");
+                        PrintWarning($"Could not find track data for '{songData.SongName}' by '{songData.ArtistName}' from '{songData.AlbumName}'");
                         continue;
                     }
+
+                    // Find the source ID
+                    using var sourceIdCommand = catalogConnection.CreateCommand();
+                    sourceIdCommand.CommandText = """
+                        SELECT object_id FROM sources WHERE source_key = $sourceKey
+                    """;
+                    sourceIdCommand.Parameters.AddWithValue("$sourceKey", sourceKey);
+
+                    using var sourceIdReader = sourceIdCommand.ExecuteReader();
+                    var sourceId = string.Empty;
+                    if (sourceIdReader.Read())
+                    {
+                        sourceId = sourceIdReader.GetString(0);
+                    }
+
+                    if (string.IsNullOrWhiteSpace(sourceId))
+                    {
+                        PrintWarning($"Could not find source_id for source_key '{sourceKey}'");
+                        continue;
+                    }
+
+                    // Update the native play count
+                    using var updateCommand = catalogConnection.CreateCommand();
+                    updateCommand.CommandText = """
+                        UPDATE tracks
+                        SET native_play_count = MAX(native_play_count, $playCount)
+                        WHERE object_id = $id
+                    """;
+                    updateCommand.Parameters.AddWithValue("$playCount", songData.PlayCount);
+                    updateCommand.Parameters.AddWithValue("$id", objectId);
+                    updateCommand.ExecuteNonQuery();
 
                     using var existsCommand = catalogConnection.CreateCommand();
                     existsCommand.CommandText = """
                         SELECT *
-                        FROM activity_baseline
+                        FROM legacy_activity
                         WHERE track_object_id = $id
                     """;
                     existsCommand.Parameters.AddWithValue("$id", objectId);
@@ -198,42 +266,49 @@ namespace iOpenPodToRufinScrobble
 
                     if (exists)
                     {
-                        using var updateCommand = catalogConnection.CreateCommand();
-                        updateCommand.CommandText = """
-                            UPDATE activity_baseline
-                            SET play_count = $playCount
+                        using var activityCommand = catalogConnection.CreateCommand();
+                        activityCommand.CommandText = """
+                            UPDATE legacy_activity
+                            SET play_count = MAX(play_count, $playCount)
                             WHERE track_object_id = $id
                         """;
-                        updateCommand.Parameters.AddWithValue("$playCount", songData.PlayCount);
-                        updateCommand.Parameters.AddWithValue("$id", objectId);
-                        updateCommand.ExecuteNonQuery();
+                        activityCommand.Parameters.AddWithValue("$playCount", songData.PlayCount);
+                        activityCommand.Parameters.AddWithValue("$id", objectId);
+                        activityCommand.ExecuteNonQuery();
                     }
                     else
                     {
                         using var insertCommand = catalogConnection.CreateCommand();
                         insertCommand.CommandText = """
-                            INSERT INTO activity_baseline (source_key, period, item_kind, track_object_id, play_count, skip_count)
-                            VALUES ($sourceKey, 'lifetime', 'track', $id, $playCount, 0)
+                            INSERT INTO legacy_activity (source_id, period, item_kind, track_object_id, play_count, skip_count, last_played_at, title, artist, album)
+                            VALUES ($sourceKey, 'lifetime', 'track', $id, $playCount, 0, $lastPlayedAt, $title, $artist, $album)
                         """;
-                        insertCommand.Parameters.AddWithValue("$sourceKey", sourceKey);
+                        insertCommand.Parameters.AddWithValue("$sourceKey", sourceId);
                         insertCommand.Parameters.AddWithValue("$playCount", songData.PlayCount);
                         insertCommand.Parameters.AddWithValue("$id", objectId);
+                        insertCommand.Parameters.AddWithValue("$lastPlayedAt", startedAt);
+                        insertCommand.Parameters.AddWithValue("$title", title);
+                        insertCommand.Parameters.AddWithValue("$artist", artist);
+                        insertCommand.Parameters.AddWithValue("$album", album);
                         insertCommand.ExecuteNonQuery();
                     }
                 }
 
-                File.Move(rufinCatalogPath, rufinCatalogBackupPath, true);
-
                 catalogConnection.Close();
-                File.Move(rufinCatalogWorkingPath, rufinCatalogPath, true);
-                
-                // Cleanup temp files
-                File.Delete(Path.Combine(Path.GetDirectoryName(rufinCatalogPath), "rufin-catalog.working.sqlite-shm"));
-                File.Delete(Path.Combine(Path.GetDirectoryName(rufinCatalogPath), "rufin-catalog.working.sqlite-wal"));
+
+                File.Move(rufinLibraryPath, rufinLibraryBackupPath, true);
+
+                // Rename working files
+                File.Move(rufinLibraryWorkingPath, rufinLibraryPath, true);
+                File.Move(rufinLibraryWorkingPath + "-shm", rufinLibraryPath + "-shm", true);
+                File.Move(rufinLibraryWorkingPath + "-wal", rufinLibraryPath + "-wal", true);
+
+                // Delete the cache
+                File.Delete(Path.Combine(rufinDataPath, "store", "rufin-library.image"));
             }
             catch (Exception ex)
             {
-                PrintError($"Error syncing to Rufin databases: {ex}");
+                PrintError($"Error syncing to Rufin database: {ex}");
                 return false;
             }
 
